@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Magic Garden Plant Drag Mover
 // @namespace    http://tampermonkey.net/
-// @version      0.0.3
+// @version      0.0.4
 // @description  Click & hold a plant for one second, drag it to a highlighted tile, and release to move it.
 // @author       Liam
 // @updateURL    https://github.com/Liam0306dis/click-to-drag/raw/refs/heads/main/plant-drag-move.user.js
+// @downloadURL  https://github.com/Liam0306dis/click-to-drag/raw/refs/heads/main/plant-drag-move.user.js
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
 // @grant        unsafeWindow
@@ -348,6 +349,35 @@
         if (live.fallbackHighlight) live.fallbackHighlight.visible = false;
     }
 
+    function fadeSourcePlant(activePress) {
+        const tileView = live.tileSystem?.tileViews?.get(activePress.source.globalIndex);
+        const displayObject = tileView?.displayObject;
+        if (!displayObject) return;
+        activePress.fadedDisplayObject = displayObject;
+        activePress.sourceAlpha = displayObject.alpha;
+        const startedAt = performance.now();
+        const fromAlpha = displayObject.alpha;
+        const toAlpha = Math.min(fromAlpha, 0.28);
+        const animate = now => {
+            if (activePress.fadedDisplayObject !== displayObject || displayObject.destroyed) return;
+            const progress = Math.min(1, (now - startedAt) / 180);
+            displayObject.alpha = fromAlpha + (toAlpha - fromAlpha) * progress;
+            if (progress < 1) activePress.fadeFrame = pageWindow.requestAnimationFrame(animate);
+        };
+        activePress.fadeFrame = pageWindow.requestAnimationFrame(animate);
+    }
+
+    function restoreSourcePlant(activePress) {
+        if (activePress.fadeFrame) pageWindow.cancelAnimationFrame(activePress.fadeFrame);
+        const displayObject = activePress.fadedDisplayObject;
+        if (displayObject && !displayObject.destroyed && activePress.sourceAlpha != null) {
+            displayObject.alpha = activePress.sourceAlpha;
+        }
+        activePress.fadedDisplayObject = null;
+        activePress.sourceAlpha = null;
+        activePress.fadeFrame = 0;
+    }
+
     function hasPlanterPot() {
         return live.inventoryItems.some(item =>
             item?.itemType === 'Tool'
@@ -405,7 +435,7 @@
         log(`Sent PlantGardenPlant for farm slot ${slot}.`, { itemId });
     }
 
-    async function potHeldPlant(activePress) {
+    function prepareHeldPlant(activePress) {
         const source = pointToFarmTile(activePress.startX, activePress.startY, activePress.target);
         if (!source || source.object?.objectType !== 'plant') {
             throw new Error('That is not a Plant!');
@@ -419,47 +449,50 @@
         if (!hasPlanterPot()) throw new Error('No Planter Pot is available in your inventory');
 
         activePress.source = source;
+        activePress.phase = 'dragging';
+        fadeSourcePlant(activePress);
+        showToast('Drag to a highlighted empty tile and release.', 'success', 0);
+    }
+
+    function getValidDestination(activePress) {
+        const destination = pointToFarmTile(
+            activePress.releaseX,
+            activePress.releaseY,
+            activePress.target,
+        );
+        if (!destination) throw new Error('Release over one of your farm tiles');
+        if (destination.userSlotIdx !== live.ownUserSlotIdx) {
+            throw new Error('That tile is not in your garden');
+        }
+        if (destination.object) throw new Error('The destination tile is occupied');
+        return destination;
+    }
+
+    async function commitHeldMove(activePress) {
+        const destination = getValidDestination(activePress);
+        activePress.destination = destination;
         activePress.phase = 'potting';
-        const species = source.object.species;
+        const species = activePress.source.object.species;
         const beforeIds = inventoryIds();
         showToast(`Picking up ${species ?? 'plant'}...`, 'normal', 0);
-        sendPotPlant(source.localTileIndex);
+        sendPotPlant(activePress.source.localTileIndex);
 
-        const plantItem = await waitFor(() => findNewPlant(beforeIds, source.object), POT_TIMEOUT_MS);
+        const plantItem = await waitFor(() => findNewPlant(beforeIds, activePress.source.object), POT_TIMEOUT_MS);
+        restoreSourcePlant(activePress);
         if (!plantItem) throw new Error('The server did not return the potted plant');
 
         activePress.plantItem = plantItem;
-        if (activePress.cancelled) {
-            moveBusy = false;
-            showToast('Move cancelled. The potted plant is in your inventory.', 'error', 5000);
-            return;
-        }
         activePress.phase = 'ready';
-        showToast('Plant picked up. Release over a highlighted empty tile.', 'success', 0);
-        if (activePress.released) await placeHeldPlant(activePress);
+        await placeHeldPlant(activePress, destination);
     }
 
-    async function placeHeldPlant(activePress) {
+    async function placeHeldPlant(activePress, destination) {
         if (activePress.phase === 'placing' || activePress.cancelled) return;
         try {
-            const destination = pointToFarmTile(
-                activePress.releaseX,
-                activePress.releaseY,
-                activePress.target,
-            );
-            if (!destination) {
+            const currentObject = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
+            if (currentObject) {
                 activePress.cancelled = true;
-                showToast('Move stopped: release over one of your farm tiles.', 'error', 4000);
-                return;
-            }
-            if (destination.userSlotIdx !== live.ownUserSlotIdx) {
-                activePress.cancelled = true;
-                showToast('Move stopped: that tile is not in your garden.', 'error', 4000);
-                return;
-            }
-            if (destination.object) {
-                activePress.cancelled = true;
-                showToast('Move stopped: the destination tile is occupied. The plant remains in inventory.', 'error', 5000);
+                showToast('Move stopped: the destination became occupied. The plant remains in inventory.', 'error', 5000);
                 return;
             }
 
@@ -497,12 +530,15 @@
         }
 
         moveBusy = true;
-        potHeldPlant(activePress).catch(error => {
+        try {
+            prepareHeldPlant(activePress);
+        } catch (error) {
             activePress.cancelled = true;
             moveBusy = false;
+            restoreSourcePlant(activePress);
             log('Move cancelled.', error);
             showToast(`Move cancelled: ${error.message}.`, 'error', 4500);
-        });
+        }
     }
 
     function clearPress(activePress) {
@@ -573,14 +609,14 @@
         event.preventDefault();
         event.stopImmediatePropagation();
 
-        if (activePress.phase === 'ready') {
-            placeHeldPlant(activePress).catch(error => {
+        if (activePress.phase === 'dragging') {
+            commitHeldMove(activePress).catch(error => {
                 activePress.cancelled = true;
-                log('Placement failed.', error);
+                moveBusy = false;
+                restoreSourcePlant(activePress);
+                log('Move failed.', error);
                 showToast(`Move stopped: ${error.message}.`, 'error', 4500);
             });
-        } else if (!activePress.cancelled) {
-            showToast('Finishing pickup before placing...', 'normal', 0);
         }
         clearPress(activePress);
     }, true);
@@ -589,16 +625,10 @@
         const activePress = press;
         if (!activePress || event.pointerId !== activePress.pointerId) return;
         activePress.cancelled = true;
+        restoreSourcePlant(activePress);
         if (activePress.activated) {
-            if (activePress.phase === 'potting') {
-                showToast('Move cancelled. If pickup completes, the plant will remain in your inventory.', 'error', 5000);
-            } else if (activePress.plantItem) {
-                moveBusy = false;
-                showToast('Move cancelled. The potted plant is in your inventory.', 'error', 5000);
-            } else {
-                moveBusy = false;
-                showToast('Plant move cancelled.', 'error', 3000);
-            }
+            moveBusy = false;
+            showToast('Plant move cancelled.', 'error', 3000);
         }
         clearPress(activePress);
     }, true);
