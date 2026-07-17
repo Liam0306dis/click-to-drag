@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Magic Garden Plant Drag Mover
 // @namespace    http://tampermonkey.net/
-// @version      0.0.6
+// @version      0.0.7
 // @description  Click & hold a plant for one second, drag it to a highlighted tile, and release to move it.
 // @author       Liam
 // @updateURL    https://github.com/Liam0306dis/click-to-drag/raw/refs/heads/main/plant-drag-move.user.js
@@ -21,11 +21,13 @@
     const POT_TIMEOUT_MS = 10_000;
     const PLACE_TIMEOUT_MS = 12_000;
     const TILE_SIZE = 256;
+    const NATIVE_INPUT_GRACE_MS = 1500;
     const WRAPPED_FLAG = '__plantDragMoverWrapped';
 
     const live = {
         tapToMove: null,
         tileSystem: null,
+        worldTapRouter: null,
         inventoryItems: [],
         inventoryReady: false,
         ownUserSlotIdx: null,
@@ -33,6 +35,8 @@
         currentGardenTile: null,
         isInMyGarden: false,
         hudSuppressed: false,
+        nativeActionHolding: false,
+        blockDragUntil: 0,
         activeSocket: null,
         fallbackHighlight: null,
     };
@@ -60,11 +64,13 @@
         live.fallbackHighlight?.destroy?.();
         live.tapToMove = null;
         live.tileSystem = null;
+        live.worldTapRouter = null;
         live.fallbackHighlight = null;
         live.ownUserSlotIdx = null;
         live.currentGardenTile = null;
         live.isInMyGarden = false;
         live.hudSuppressed = false;
+        live.nativeActionHolding = false;
         armPrivateSystemCapture();
         log(`${reason}; waiting for the rebuilt farm systems.`);
     }
@@ -96,6 +102,11 @@
             armedSystemFields.delete(key);
             delete objectProto[key];
             log('Native farm tile map connected.');
+        } else if (key === 'registeredClaimants' && target?.name === 'worldTapRouter' && Array.isArray(value)) {
+            live.worldTapRouter = target;
+            armedSystemFields.delete(key);
+            delete objectProto[key];
+            log('Native canvas UI hit testing connected.');
         }
     }
 
@@ -106,7 +117,7 @@
     };
 
     function armPrivateSystemCapture() {
-        for (const key of ['lastHoverGridX', 'tileViews']) {
+        for (const key of ['lastHoverGridX', 'tileViews', 'registeredClaimants']) {
             if (armedSystemFields.has(key)) continue;
             armedSystemFields.add(key);
             originalDefineProperty.call(objectCtor, objectProto, key, {
@@ -266,6 +277,26 @@
             }],
             ['hudSuppressedByOverlayAtom', value => {
                 live.hudSuppressed = value === true;
+                if (live.hudSuppressed) {
+                    live.blockDragUntil = Math.max(live.blockDragUntil, performance.now() + NATIVE_INPUT_GRACE_MS);
+                }
+            }],
+            ['actionHoldVisualStateAtom', value => {
+                live.nativeActionHolding = value?.kind === 'holding';
+                if (live.nativeActionHolding) {
+                    live.blockDragUntil = Math.max(live.blockDragUntil, performance.now() + NATIVE_INPUT_GRACE_MS);
+                }
+                if (!live.nativeActionHolding || !press) return;
+
+                const nativePress = press;
+                nativePress.cancelled = true;
+                restoreSourcePlant(nativePress);
+                moveBusy = false;
+                if (nativePress.activated) {
+                    showToast('Plant move cancelled for the game action.', 'normal', 2200);
+                }
+                clearPress(nativePress);
+                log('Native hold action claimed the pointer; plant drag cancelled.');
             }],
         ];
 
@@ -301,18 +332,36 @@
         });
     }
 
+    function clientToGameGlobal(clientX, clientY, canvas) {
+        const renderer = live.worldTapRouter?.renderer ?? live.tapToMove?.renderer;
+        if (!renderer) return null;
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return null;
+        return {
+            x: (clientX - rect.left) * renderer.screen.width / rect.width,
+            y: (clientY - rect.top) * renderer.screen.height / rect.height,
+        };
+    }
+
+    function isPointerOverGameUi(event) {
+        const router = live.worldTapRouter;
+        const global = clientToGameGlobal(event.clientX, event.clientY, event.target);
+        if (!router?.isWorldPointerSuppressed || !global) return false;
+        try {
+            return router.isWorldPointerSuppressed(global, event.pointerType) === true;
+        } catch (error) {
+            log('Native canvas UI hit test failed.', error);
+            return false;
+        }
+    }
+
     function pointToFarmTile(clientX, clientY, canvas) {
         const tapToMove = live.tapToMove;
         const tileSystem = live.tileSystem;
         if (!tapToMove?.renderer || !tileSystem?.worldContainer || !tileSystem?.map) return null;
 
-        const rect = canvas.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return null;
-        const screen = tapToMove.renderer.screen;
-        const global = {
-            x: (clientX - rect.left) * screen.width / rect.width,
-            y: (clientY - rect.top) * screen.height / rect.height,
-        };
+        const global = clientToGameGlobal(clientX, clientY, canvas);
+        if (!global) return null;
         const world = tileSystem.worldContainer.toLocal(global);
         const x = Math.floor(world.x / TILE_SIZE);
         const y = Math.floor(world.y / TILE_SIZE);
@@ -575,8 +624,17 @@
 
     document.addEventListener('pointerdown', event => {
         if (press || event.button !== 0 || !event.isPrimary || !isGameCanvas(event.target)) return;
+        if (isPointerOverGameUi(event)) {
+            log('Ignored plant drag input over a native canvas control.');
+            return;
+        }
+        if (live.nativeActionHolding) return;
         if (live.hudSuppressed) {
             log('Ignored plant drag input while a game overlay is open.');
+            return;
+        }
+        if (performance.now() < live.blockDragUntil) {
+            log('Ignored plant drag input during the native-action grace period.');
             return;
         }
         if (moveBusy) {
