@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Magic Garden Plant Drag Mover
 // @namespace    http://tampermonkey.net/
-// @version      0.0.4
+// @version      0.0.5
 // @description  Click & hold a plant for one second, drag it to a highlighted tile, and release to move it.
 // @author       Liam
 // @updateURL    https://github.com/Liam0306dis/click-to-drag/raw/refs/heads/main/plant-drag-move.user.js
@@ -32,6 +32,7 @@
         currentGlobalTile: null,
         currentGardenTile: null,
         isInMyGarden: false,
+        hudSuppressed: false,
         activeSocket: null,
         fallbackHighlight: null,
     };
@@ -118,6 +119,7 @@
                     live.ownUserSlotIdx = null;
                     live.currentGardenTile = null;
                     live.isInMyGarden = false;
+                    live.hudSuppressed = false;
                     armPrivateSystemCapture();
                     log('Reconnect detected; waiting for the rebuilt farm systems.');
                 }
@@ -241,6 +243,9 @@
             ['isInMyGardenAtom', value => {
                 live.isInMyGarden = value === true;
                 refreshOwnUserSlot();
+            }],
+            ['hudSuppressedByOverlayAtom', value => {
+                live.hudSuppressed = value === true;
             }],
         ];
 
@@ -550,6 +555,10 @@
 
     document.addEventListener('pointerdown', event => {
         if (press || event.button !== 0 || !event.isPrimary || !isGameCanvas(event.target)) return;
+        if (live.hudSuppressed) {
+            log('Ignored plant drag input while a game overlay is open.');
+            return;
+        }
         if (moveBusy) {
             showToast('Finish the current plant move before starting another.', 'error', 3500);
             return;
@@ -581,6 +590,15 @@
         const activePress = press;
         if (!activePress || event.pointerId !== activePress.pointerId) return;
 
+        if (live.hudSuppressed) {
+            activePress.cancelled = true;
+            restoreSourcePlant(activePress);
+            moveBusy = false;
+            if (activePress.activated) showToast('Plant move cancelled because a menu opened.', 'error', 3000);
+            clearPress(activePress);
+            return;
+        }
+
         if (!activePress.activated) {
             const distance = Math.hypot(event.clientX - activePress.startX, event.clientY - activePress.startY);
             if (distance > HOLD_MOVE_TOLERANCE_PX) {
@@ -596,6 +614,19 @@
     document.addEventListener('pointerup', event => {
         const activePress = press;
         if (!activePress || event.pointerId !== activePress.pointerId) return;
+
+        if (live.hudSuppressed) {
+            activePress.cancelled = true;
+            restoreSourcePlant(activePress);
+            moveBusy = false;
+            if (activePress.activated) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                showToast('Plant move cancelled because a menu opened.', 'error', 3000);
+            }
+            clearPress(activePress);
+            return;
+        }
 
         activePress.releaseX = event.clientX;
         activePress.releaseY = event.clientY;
