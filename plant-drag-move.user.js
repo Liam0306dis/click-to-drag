@@ -1,0 +1,564 @@
+// ==UserScript==
+// @name         Magic Garden Plant Drag Mover
+// @namespace    http://tampermonkey.net/
+// @version      0.0.2
+// @description  Click & hold a plant for one second, drag it to a highlighted tile, and release to move it.
+// @author       Liam
+// @match        https://magiccircle.gg/r/*
+// @match        https://magicgarden.gg/r/*
+// @grant        unsafeWindow
+// @run-at       document-start
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const HOLD_MS = 1000;
+    const HOLD_MOVE_TOLERANCE_PX = 12;
+    const POT_TIMEOUT_MS = 10_000;
+    const PLACE_TIMEOUT_MS = 12_000;
+    const TILE_SIZE = 256;
+    const WRAPPED_FLAG = '__plantDragMoverWrapped';
+
+    const live = {
+        tapToMove: null,
+        tileSystem: null,
+        inventoryItems: [],
+        inventoryReady: false,
+        ownUserSlotIdx: null,
+        currentGlobalTile: null,
+        currentGardenTile: null,
+        isInMyGarden: false,
+        activeSocket: null,
+    };
+
+    let press = null;
+    let toastTimer = 0;
+    let lastLoggedPlanterPotCount = null;
+    let openedRoomSocketCount = 0;
+    let moveBusy = false;
+
+    function log(message, detail) {
+        if (detail === undefined) console.log(`[PlantDrag] ${message}`);
+        else console.log(`[PlantDrag] ${message}`, detail);
+    }
+
+    // The game recreates both systems after an in-page reconnect. Keep the
+    // defineProperty observer installed and briefly re-arm its two field traps
+    // whenever a replacement socket opens.
+    const objectCtor = pageWindow.Object;
+    const objectProto = objectCtor.prototype;
+    const originalDefineProperty = objectCtor.defineProperty;
+    const armedSystemFields = new Set();
+
+    function capturePrivateSystem(target, key, value) {
+        if (key === 'lastHoverGridX' && target?.name === 'tapToMove') {
+            live.tapToMove = target;
+            armedSystemFields.delete(key);
+            delete objectProto[key];
+            log('Native tap-to-move highlight connected.');
+        } else if (key === 'tileViews' && target?.name === 'tileObject' && value instanceof pageWindow.Map) {
+            live.tileSystem = target;
+            live.ownUserSlotIdx = null;
+            armedSystemFields.delete(key);
+            delete objectProto[key];
+            log('Native farm tile map connected.');
+        }
+    }
+
+    objectCtor.defineProperty = function(target, key, descriptor) {
+        const result = originalDefineProperty.call(this, target, key, descriptor);
+        if (armedSystemFields.has(key)) capturePrivateSystem(target, key, descriptor?.value);
+        return result;
+    };
+
+    function armPrivateSystemCapture() {
+        for (const key of ['lastHoverGridX', 'tileViews']) {
+            if (armedSystemFields.has(key)) continue;
+            armedSystemFields.add(key);
+            originalDefineProperty.call(objectCtor, objectProto, key, {
+                configurable: true,
+                get() { return undefined; },
+                set(value) {
+                    originalDefineProperty.call(objectCtor, this, key, {
+                        configurable: true,
+                        enumerable: true,
+                        writable: true,
+                        value,
+                    });
+                    capturePrivateSystem(this, key, value);
+                },
+            });
+        }
+    }
+
+    armPrivateSystemCapture();
+
+    function captureGameSocket() {
+        const OriginalWebSocket = pageWindow.WebSocket;
+        if (!OriginalWebSocket || OriginalWebSocket[WRAPPED_FLAG]) return;
+
+        function PlantDragWebSocket(...args) {
+            const socket = new OriginalWebSocket(...args);
+            const isRoomSocket = String(args[0] ?? '').includes('/api/rooms/');
+            if (!isRoomSocket) return socket;
+
+            live.activeSocket = socket;
+            socket.addEventListener('open', () => {
+                openedRoomSocketCount++;
+                if (openedRoomSocketCount > 1) {
+                    live.tapToMove = null;
+                    live.tileSystem = null;
+                    live.ownUserSlotIdx = null;
+                    live.currentGardenTile = null;
+                    live.isInMyGarden = false;
+                    armPrivateSystemCapture();
+                    log('Reconnect detected; waiting for the rebuilt farm systems.');
+                }
+            });
+            return socket;
+        }
+
+        PlantDragWebSocket.prototype = OriginalWebSocket.prototype;
+        objectCtor.setPrototypeOf(PlantDragWebSocket, OriginalWebSocket);
+        PlantDragWebSocket[WRAPPED_FLAG] = true;
+        pageWindow.WebSocket = PlantDragWebSocket;
+    }
+
+    captureGameSocket();
+
+    function ensureToast() {
+        let toast = document.getElementById('mg-plant-drag-toast');
+        if (toast) return toast;
+
+        toast = document.createElement('div');
+        toast.id = 'mg-plant-drag-toast';
+        toast.style.cssText = [
+            'position:fixed',
+            'top:18px',
+            'left:50%',
+            'transform:translateX(-50%) translateY(-12px)',
+            'z-index:2147483647',
+            'max-width:min(420px,calc(100vw - 32px))',
+            'padding:9px 13px',
+            'border:1px solid rgba(255,255,255,.2)',
+            'border-radius:6px',
+            'background:rgba(12,18,24,.94)',
+            'box-shadow:0 6px 24px rgba(0,0,0,.45)',
+            'color:#f4f7f8',
+            'font:600 12px/1.35 system-ui,sans-serif',
+            'letter-spacing:0',
+            'text-align:center',
+            'opacity:0',
+            'pointer-events:none',
+            'transition:opacity .16s ease,transform .16s ease',
+        ].join(';');
+        document.documentElement.appendChild(toast);
+        return toast;
+    }
+
+    function showToast(message, tone = 'normal', duration = 2200) {
+        if (!document.documentElement) return;
+        const toast = ensureToast();
+        toast.textContent = message;
+        toast.style.borderColor = tone === 'error'
+            ? 'rgba(248,113,113,.65)'
+            : tone === 'success'
+                ? 'rgba(74,222,128,.55)'
+                : 'rgba(255,255,255,.2)';
+        toast.style.color = tone === 'error' ? '#fecaca' : tone === 'success' ? '#bbf7d0' : '#f4f7f8';
+        toast.style.opacity = '1';
+        toast.style.transform = 'translateX(-50%) translateY(0)';
+        clearTimeout(toastTimer);
+        if (duration > 0) {
+            toastTimer = setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateX(-50%) translateY(-12px)';
+            }, duration);
+        }
+    }
+
+    function atomMap() {
+        const cache = pageWindow.jotaiAtomCache;
+        return cache?.cache ?? cache ?? null;
+    }
+
+    function hookAtom(debugLabel, onValue) {
+        const map = atomMap();
+        if (!map || typeof map.values !== 'function') return false;
+
+        for (const atom of map.values()) {
+            if (atom?.debugLabel !== debugLabel || typeof atom.read !== 'function') continue;
+            const flag = `${WRAPPED_FLAG}:${debugLabel}`;
+            if (atom[flag]) return true;
+
+            const originalRead = atom.read;
+            atom.read = function(get, ...args) {
+                const value = originalRead.call(this, get, ...args);
+                try { onValue(value); } catch (error) { console.warn('[PlantDrag] Atom observer failed:', error); }
+                return value;
+            };
+            atom[flag] = true;
+            return true;
+        }
+        return false;
+    }
+
+    function refreshOwnUserSlot() {
+        if (!live.isInMyGarden) return;
+        const userSlotIdx = live.currentGardenTile?.userSlotIdx;
+        if (userSlotIdx != null) live.ownUserSlotIdx = userSlotIdx;
+    }
+
+    function installAtomHooks() {
+        const hooks = [
+            ['myOptimisticInventoryItemsAtom', value => {
+                if (Array.isArray(value)) {
+                    live.inventoryItems = value;
+                    live.inventoryReady = true;
+                    const planterPotCount = value.reduce((total, item) =>
+                        item?.itemType === 'Tool' && item?.toolId === 'PlanterPot'
+                            ? total + (item.quantity ?? 1)
+                            : total, 0);
+                    if (planterPotCount !== lastLoggedPlanterPotCount) {
+                        lastLoggedPlanterPotCount = planterPotCount;
+                        log(`Planter Pots in inventory: ${planterPotCount}`);
+                    }
+                }
+            }],
+            ['myCurrentGlobalTileIndexAtom', value => {
+                live.currentGlobalTile = value;
+            }],
+            ['myCurrentGardenTileAtom', value => {
+                live.currentGardenTile = value;
+            }],
+            ['isInMyGardenAtom', value => {
+                live.isInMyGarden = value === true;
+                refreshOwnUserSlot();
+            }],
+        ];
+
+        let installed = 0;
+        for (const [label, handler] of hooks) {
+            if (hookAtom(label, handler)) installed++;
+        }
+        return installed === hooks.length;
+    }
+
+    const atomHookInterval = setInterval(() => {
+        if (installAtomHooks()) {
+            clearInterval(atomHookInterval);
+            log('Native inventory state connected.');
+        }
+    }, 250);
+
+    function isGameCanvas(target) {
+        return target?.tagName === 'CANVAS';
+    }
+
+    function waitFor(condition, timeoutMs, intervalMs = 100) {
+        const started = performance.now();
+        return new Promise(resolve => {
+            const poll = setInterval(() => {
+                let value = null;
+                try { value = condition(); } catch { value = null; }
+                if (value || performance.now() - started >= timeoutMs) {
+                    clearInterval(poll);
+                    resolve(value || null);
+                }
+            }, intervalMs);
+        });
+    }
+
+    function pointToFarmTile(clientX, clientY, canvas) {
+        const tapToMove = live.tapToMove;
+        const tileSystem = live.tileSystem;
+        if (!tapToMove?.renderer || !tileSystem?.worldContainer || !tileSystem?.map) return null;
+
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return null;
+        const screen = tapToMove.renderer.screen;
+        const global = {
+            x: (clientX - rect.left) * screen.width / rect.width,
+            y: (clientY - rect.top) * screen.height / rect.height,
+        };
+        const world = tileSystem.worldContainer.toLocal(global);
+        const x = Math.floor(world.x / TILE_SIZE);
+        const y = Math.floor(world.y / TILE_SIZE);
+        const map = tileSystem.map;
+        if (x < 0 || y < 0 || x >= map.cols || y >= map.rows) return null;
+
+        const globalIndex = x + y * map.cols;
+        const dirt = map.globalTileIdxToDirtTile?.[globalIndex];
+        if (!dirt) return null;
+        return {
+            x,
+            y,
+            globalIndex,
+            userSlotIdx: dirt.userSlotIdx,
+            localTileIndex: dirt.dirtTileIdx,
+            object: tileSystem.getTileDataAt({ x, y }) ?? null,
+        };
+    }
+
+    function hasPlanterPot() {
+        return live.inventoryItems.some(item =>
+            item?.itemType === 'Tool'
+            && item?.toolId === 'PlanterPot'
+            && (item?.quantity ?? 1) > 0);
+    }
+
+    function inventoryIds() {
+        return new Set(live.inventoryItems.map(item => item?.id).filter(Boolean));
+    }
+
+    function isSamePlant(candidate, source) {
+        if (candidate?.species !== source?.species) return false;
+        if (source?.plantedAt != null && candidate?.plantedAt !== source.plantedAt) return false;
+        if (source?.maturedAt != null && candidate?.maturedAt !== source.maturedAt) return false;
+        return true;
+    }
+
+    function findNewPlant(beforeIds, source) {
+        return live.inventoryItems.find(item =>
+            item?.itemType === 'Plant'
+            && isSamePlant(item, source)
+            && item?.id
+            && !beforeIds.has(item.id));
+    }
+
+    function sendMessage(message) {
+        const socket = live.activeSocket;
+        if (!socket || socket.readyState !== pageWindow.WebSocket.OPEN) {
+            throw new Error('Game WebSocket is not connected');
+        }
+        socket.send(JSON.stringify(message));
+    }
+
+    function sendPotPlant(slot) {
+        const requestId = pageWindow.crypto.randomUUID();
+        sendMessage({
+            scopePath: ['Room', 'Quinoa'],
+            type: 'QuinoaCommand',
+            requestId,
+            command: { type: 'PotPlant', slot },
+        });
+        log(`Sent PotPlant for farm slot ${slot}.`, { requestId });
+    }
+
+    function sendPlantGardenPlant(slot, itemId) {
+        // The native v730 client still sends PlantGardenPlant through its legacy
+        // fire-and-forget path; unlike PotPlant, it is not a QuinoaCommand RPC.
+        sendMessage({
+            scopePath: ['Room', 'Quinoa'],
+            type: 'PlantGardenPlant',
+            slot,
+            itemId,
+        });
+        log(`Sent PlantGardenPlant for farm slot ${slot}.`, { itemId });
+    }
+
+    async function potHeldPlant(activePress) {
+        const source = pointToFarmTile(activePress.startX, activePress.startY, activePress.target);
+        if (!source || source.object?.objectType !== 'plant') {
+            throw new Error('That is not a Plant!');
+        }
+        if (live.ownUserSlotIdx == null) {
+            throw new Error('Stand on a tile in your own garden first so ownership can be verified');
+        }
+        if (source.userSlotIdx !== live.ownUserSlotIdx) {
+            throw new Error('That plant is not in your garden');
+        }
+        if (!hasPlanterPot()) throw new Error('No Planter Pot is available in your inventory');
+
+        activePress.source = source;
+        activePress.phase = 'potting';
+        const species = source.object.species;
+        const beforeIds = inventoryIds();
+        showToast(`Picking up ${species ?? 'plant'}...`, 'normal', 0);
+        sendPotPlant(source.localTileIndex);
+
+        const plantItem = await waitFor(() => findNewPlant(beforeIds, source.object), POT_TIMEOUT_MS);
+        if (!plantItem) throw new Error('The server did not return the potted plant');
+
+        activePress.plantItem = plantItem;
+        if (activePress.cancelled) {
+            moveBusy = false;
+            showToast('Move cancelled. The potted plant is in your inventory.', 'error', 5000);
+            return;
+        }
+        activePress.phase = 'ready';
+        showToast('Plant picked up. Release over a highlighted empty tile.', 'success', 0);
+        if (activePress.released) await placeHeldPlant(activePress);
+    }
+
+    async function placeHeldPlant(activePress) {
+        if (activePress.phase === 'placing' || activePress.cancelled) return;
+        try {
+            const destination = pointToFarmTile(
+                activePress.releaseX,
+                activePress.releaseY,
+                activePress.target,
+            );
+            if (!destination) {
+                activePress.cancelled = true;
+                showToast('Move stopped: release over one of your farm tiles.', 'error', 4000);
+                return;
+            }
+            if (destination.userSlotIdx !== live.ownUserSlotIdx) {
+                activePress.cancelled = true;
+                showToast('Move stopped: that tile is not in your garden.', 'error', 4000);
+                return;
+            }
+            if (destination.object) {
+                activePress.cancelled = true;
+                showToast('Move stopped: the destination tile is occupied. The plant remains in inventory.', 'error', 5000);
+                return;
+            }
+
+            activePress.phase = 'placing';
+            showToast('Placing plant...', 'normal', 0);
+            sendPlantGardenPlant(destination.localTileIndex, activePress.plantItem.id);
+
+            const placed = await waitFor(() => {
+                const object = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
+                const itemStillHeld = live.inventoryItems.some(item => item?.id === activePress.plantItem.id);
+                return !itemStillHeld && object?.objectType === 'plant'
+                    && isSamePlant(object, activePress.source.object);
+            }, PLACE_TIMEOUT_MS, 150);
+
+            if (placed) {
+                showToast('Plant moved.', 'success');
+                log(`Moved ${activePress.source.object.species} from slot ${activePress.source.localTileIndex} to ${destination.localTileIndex}.`);
+            } else {
+                showToast('Placement was not confirmed. Check your inventory before retrying.', 'error', 5000);
+            }
+        } finally {
+            moveBusy = false;
+        }
+    }
+
+    function activatePress(activePress) {
+        if (press !== activePress || activePress.cancelled || activePress.released) return;
+        activePress.activated = true;
+        document.documentElement.style.cursor = 'grabbing';
+
+        if (!live.tapToMove || !live.tileSystem) {
+            activePress.cancelled = true;
+            showToast('Move unavailable: waiting for the farm to finish loading.', 'error', 4000);
+            return;
+        }
+
+        moveBusy = true;
+        potHeldPlant(activePress).catch(error => {
+            activePress.cancelled = true;
+            moveBusy = false;
+            log('Move cancelled.', error);
+            showToast(`Move cancelled: ${error.message}.`, 'error', 4500);
+        });
+    }
+
+    function clearPress(activePress) {
+        clearTimeout(activePress.holdTimer);
+        if (press === activePress) press = null;
+        document.documentElement.style.cursor = '';
+    }
+
+    document.addEventListener('pointerdown', event => {
+        if (press || event.button !== 0 || !event.isPrimary || !isGameCanvas(event.target)) return;
+        if (moveBusy) {
+            showToast('Finish the current plant move before starting another.', 'error', 3500);
+            return;
+        }
+        if (live.inventoryReady && !hasPlanterPot()) {
+            showToast('A Planter Pot is required to move plants.', 'error', 4500);
+            log('Move unavailable: no Planter Pot in inventory.');
+            return;
+        }
+
+        const activePress = {
+            target: event.target,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            releaseX: event.clientX,
+            releaseY: event.clientY,
+            activated: false,
+            released: false,
+            cancelled: false,
+            phase: 'holding',
+            holdTimer: 0,
+        };
+        activePress.holdTimer = setTimeout(() => activatePress(activePress), HOLD_MS);
+        press = activePress;
+    }, true);
+
+    document.addEventListener('pointermove', event => {
+        const activePress = press;
+        if (!activePress || event.pointerId !== activePress.pointerId) return;
+
+        if (!activePress.activated) {
+            const distance = Math.hypot(event.clientX - activePress.startX, event.clientY - activePress.startY);
+            if (distance > HOLD_MOVE_TOLERANCE_PX) {
+                activePress.cancelled = true;
+                clearPress(activePress);
+            }
+        }
+        // Leave pointer movement visible to Pixi so its native tile highlight follows the drag.
+    }, true);
+
+    document.addEventListener('pointerup', event => {
+        const activePress = press;
+        if (!activePress || event.pointerId !== activePress.pointerId) return;
+
+        activePress.releaseX = event.clientX;
+        activePress.releaseY = event.clientY;
+        activePress.released = true;
+
+        if (!activePress.activated) {
+            clearPress(activePress);
+            return;
+        }
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        if (activePress.phase === 'ready') {
+            placeHeldPlant(activePress).catch(error => {
+                activePress.cancelled = true;
+                log('Placement failed.', error);
+                showToast(`Move stopped: ${error.message}.`, 'error', 4500);
+            });
+        } else if (!activePress.cancelled) {
+            showToast('Finishing pickup before placing...', 'normal', 0);
+        }
+        clearPress(activePress);
+    }, true);
+
+    document.addEventListener('pointercancel', event => {
+        const activePress = press;
+        if (!activePress || event.pointerId !== activePress.pointerId) return;
+        activePress.cancelled = true;
+        if (activePress.activated) {
+            if (activePress.phase === 'potting') {
+                showToast('Move cancelled. If pickup completes, the plant will remain in your inventory.', 'error', 5000);
+            } else if (activePress.plantItem) {
+                moveBusy = false;
+                showToast('Move cancelled. The potted plant is in your inventory.', 'error', 5000);
+            } else {
+                moveBusy = false;
+                showToast('Plant move cancelled.', 'error', 3000);
+            }
+        }
+        clearPress(activePress);
+    }, true);
+
+    document.addEventListener('contextmenu', event => {
+        if (!press?.activated) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+    }, true);
+
+    log(`Loaded. Hold a plant for ${HOLD_MS / 1000} second before dragging.`);
+})();
