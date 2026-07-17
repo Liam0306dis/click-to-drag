@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Magic Garden Plant Drag Mover
 // @namespace    http://tampermonkey.net/
-// @version      0.0.5
+// @version      0.0.6
 // @description  Click & hold a plant for one second, drag it to a highlighted tile, and release to move it.
 // @author       Liam
 // @updateURL    https://github.com/Liam0306dis/click-to-drag/raw/refs/heads/main/plant-drag-move.user.js
@@ -56,6 +56,33 @@
     const originalDefineProperty = objectCtor.defineProperty;
     const armedSystemFields = new Set();
 
+    function resetPrivateSystems(reason) {
+        live.fallbackHighlight?.destroy?.();
+        live.tapToMove = null;
+        live.tileSystem = null;
+        live.fallbackHighlight = null;
+        live.ownUserSlotIdx = null;
+        live.currentGardenTile = null;
+        live.isInMyGarden = false;
+        live.hudSuppressed = false;
+        armPrivateSystemCapture();
+        log(`${reason}; waiting for the rebuilt farm systems.`);
+    }
+
+    function watchTileSystemTeardown(system) {
+        const originalDestroy = system?.destroy;
+        if (typeof originalDestroy !== 'function' || originalDestroy[WRAPPED_FLAG]) return;
+
+        function watchedDestroy(...args) {
+            if (live.tileSystem === system || live.tileSystem === null) {
+                resetPrivateSystems('Quinoa engine teardown detected');
+            }
+            return originalDestroy.apply(this, args);
+        }
+        watchedDestroy[WRAPPED_FLAG] = true;
+        system.destroy = watchedDestroy;
+    }
+
     function capturePrivateSystem(target, key, value) {
         if (key === 'lastHoverGridX' && target?.name === 'tapToMove') {
             live.tapToMove = target;
@@ -65,6 +92,7 @@
         } else if (key === 'tileViews' && target?.name === 'tileObject' && value instanceof pageWindow.Map) {
             live.tileSystem = target;
             live.ownUserSlotIdx = null;
+            watchTileSystemTeardown(target);
             armedSystemFields.delete(key);
             delete objectProto[key];
             log('Native farm tile map connected.');
@@ -112,16 +140,8 @@
             socket.addEventListener('open', () => {
                 openedRoomSocketCount++;
                 if (openedRoomSocketCount > 1) {
-                    live.fallbackHighlight?.destroy?.();
-                    live.tapToMove = null;
-                    live.tileSystem = null;
-                    live.fallbackHighlight = null;
-                    live.ownUserSlotIdx = null;
-                    live.currentGardenTile = null;
-                    live.isInMyGarden = false;
-                    live.hudSuppressed = false;
                     armPrivateSystemCapture();
-                    log('Reconnect detected; waiting for the rebuilt farm systems.');
+                    log('Reconnect detected; private farm-system capture armed.');
                 }
             });
             return socket;
