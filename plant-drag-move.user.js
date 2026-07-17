@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Magic Garden Plant Drag Mover
 // @namespace    http://tampermonkey.net/
-// @version      0.0.2
+// @version      0.0.3
 // @description  Click & hold a plant for one second, drag it to a highlighted tile, and release to move it.
 // @author       Liam
+// @updateURL    https://github.com/Liam0306dis/click-to-drag/raw/refs/heads/main/plant-drag-move.user.js
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
 // @grant        unsafeWindow
@@ -31,6 +32,7 @@
         currentGardenTile: null,
         isInMyGarden: false,
         activeSocket: null,
+        fallbackHighlight: null,
     };
 
     let press = null;
@@ -108,8 +110,10 @@
             socket.addEventListener('open', () => {
                 openedRoomSocketCount++;
                 if (openedRoomSocketCount > 1) {
+                    live.fallbackHighlight?.destroy?.();
                     live.tapToMove = null;
                     live.tileSystem = null;
+                    live.fallbackHighlight = null;
                     live.ownUserSlotIdx = null;
                     live.currentGardenTile = null;
                     live.isInMyGarden = false;
@@ -302,6 +306,48 @@
         };
     }
 
+    function ensureFallbackHighlight() {
+        if (live.fallbackHighlight) return live.fallbackHighlight;
+        const nativeMarker = live.tapToMove?.hoverMarker;
+        const worldContainer = live.tileSystem?.worldContainer;
+        if (!nativeMarker?.constructor || !worldContainer) return null;
+
+        try {
+            const marker = new nativeMarker.constructor();
+            marker.eventMode = 'none';
+            marker.visible = false;
+            marker.zIndex = 1_000_000;
+            marker.roundRect(-128, -128, 256, 256, 16)
+                .fill({ color: 0x22c55e, alpha: 0.28 })
+                .stroke({ color: 0x052e16, width: 16, alpha: 0.55 });
+            marker.roundRect(-128, -128, 256, 256, 16)
+                .stroke({ color: 0x86efac, width: 8, alpha: 0.9 });
+            worldContainer.addChild(marker);
+            live.fallbackHighlight = marker;
+            return marker;
+        } catch (error) {
+            log('Could not create fallback tile highlight.', error);
+            return null;
+        }
+    }
+
+    function updateFallbackHighlight(activePress, clientX, clientY) {
+        if (live.tapToMove?.isTapToMoveEnabled !== false) return;
+        const marker = ensureFallbackHighlight();
+        if (!marker) return;
+
+        const tile = pointToFarmTile(clientX, clientY, activePress.target);
+        const isValid = tile
+            && tile.userSlotIdx === live.ownUserSlotIdx
+            && !tile.object;
+        marker.visible = Boolean(isValid);
+        if (isValid) marker.position.set(tile.x * TILE_SIZE + TILE_SIZE / 2, tile.y * TILE_SIZE + TILE_SIZE / 2);
+    }
+
+    function clearFallbackHighlight() {
+        if (live.fallbackHighlight) live.fallbackHighlight.visible = false;
+    }
+
     function hasPlanterPot() {
         return live.inventoryItems.some(item =>
             item?.itemType === 'Tool'
@@ -462,6 +508,7 @@
     function clearPress(activePress) {
         clearTimeout(activePress.holdTimer);
         if (press === activePress) press = null;
+        clearFallbackHighlight();
         document.documentElement.style.cursor = '';
     }
 
@@ -504,6 +551,8 @@
                 activePress.cancelled = true;
                 clearPress(activePress);
             }
+        } else {
+            updateFallbackHighlight(activePress, event.clientX, event.clientY);
         }
         // Leave pointer movement visible to Pixi so its native tile highlight follows the drag.
     }, true);
