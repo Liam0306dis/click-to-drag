@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Magic Garden Plant Drag Mover
 // @namespace    http://tampermonkey.net/
-// @version      0.0.7
+// @version      0.0.8
 // @description  Click & hold a plant for one second, drag it to a highlighted tile, and release to move it.
 // @author       Liam
 // @updateURL    https://github.com/Liam0306dis/click-to-drag/raw/refs/heads/main/plant-drag-move.user.js
@@ -89,24 +89,41 @@
         system.destroy = watchedDestroy;
     }
 
+    function disarmPrivateField(key) {
+        armedSystemFields.delete(key);
+        try {
+            delete objectProto[key];
+        } catch {}
+    }
+
+    function captureNamedSystem(system) {
+        if (system?.name === 'tapToMove') {
+            if (live.tapToMove === system) return;
+            live.tapToMove = system;
+            disarmPrivateField('lastHoverGridX');
+            log('Native tap-to-move highlight connected.');
+        } else if (system?.name === 'tileObject' && system.tileViews instanceof pageWindow.Map) {
+            if (live.tileSystem === system) return;
+            live.tileSystem = system;
+            live.ownUserSlotIdx = null;
+            watchTileSystemTeardown(system);
+            disarmPrivateField('tileViews');
+            log('Native farm tile map connected.');
+        } else if (system?.name === 'worldTapRouter' && Array.isArray(system.registeredClaimants)) {
+            if (live.worldTapRouter === system) return;
+            live.worldTapRouter = system;
+            disarmPrivateField('registeredClaimants');
+            log('Native canvas UI hit testing connected.');
+        }
+    }
+
     function capturePrivateSystem(target, key, value) {
         if (key === 'lastHoverGridX' && target?.name === 'tapToMove') {
-            live.tapToMove = target;
-            armedSystemFields.delete(key);
-            delete objectProto[key];
-            log('Native tap-to-move highlight connected.');
+            captureNamedSystem(target);
         } else if (key === 'tileViews' && target?.name === 'tileObject' && value instanceof pageWindow.Map) {
-            live.tileSystem = target;
-            live.ownUserSlotIdx = null;
-            watchTileSystemTeardown(target);
-            armedSystemFields.delete(key);
-            delete objectProto[key];
-            log('Native farm tile map connected.');
+            captureNamedSystem(target);
         } else if (key === 'registeredClaimants' && target?.name === 'worldTapRouter' && Array.isArray(value)) {
-            live.worldTapRouter = target;
-            armedSystemFields.delete(key);
-            delete objectProto[key];
-            log('Native canvas UI hit testing connected.');
+            captureNamedSystem(target);
         }
     }
 
@@ -137,6 +154,25 @@
     }
 
     armPrivateSystemCapture();
+
+    function installSystemRegistryCapture() {
+        const mapProto = pageWindow.Map?.prototype;
+        const originalSet = mapProto?.set;
+        if (typeof originalSet !== 'function' || originalSet[WRAPPED_FLAG]) return;
+
+        function watchedMapSet(key, value) {
+            const result = originalSet.call(this, key, value);
+            const system = value?.system;
+            if (system?.name === key) captureNamedSystem(system);
+            return result;
+        }
+
+        watchedMapSet[WRAPPED_FLAG] = true;
+        mapProto.set = watchedMapSet;
+        log('Engine system registry capture installed.');
+    }
+
+    installSystemRegistryCapture();
 
     function captureGameSocket() {
         const OriginalWebSocket = pageWindow.WebSocket;
